@@ -1,0 +1,404 @@
+name: AIStudio2API Pro Warm Handover Node
+on:
+  workflow_dispatch:
+    inputs:
+      cycle_count:
+        description: 'Completed handover cycles count'
+        required: false
+        default: '0'
+      retry_depth:
+        description: 'Consecutive dispatch retry circuit breaker depth'
+        required: false
+        default: '0'
+      test_handover:
+        description: 'Emergency test shift length in minutes (0 = full 315m shift)'
+        required: false
+        default: '0'
+
+permissions: {}
+
+jobs:
+  relay-node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pre-Warm AIStudio2API & Camoufox Backend
+        id: prewarm
+        env:
+          CLONE_PAT: ${{ secrets.CLONE_PAT }}
+        run: |
+          set -euo pipefail
+          set +x
+
+          echo "Installing system dependencies and Camoufox Gecko engine..."
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            curl jq git python3 python3-pip xvfb \
+            libgtk-3-0 libasound2t64 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+            libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 libcairo2
+          pip3 install --break-system-packages --no-cache-dir "camoufox[geoip]"
+          python3 -m camoufox fetch
+
+          echo "Cloning private AIStudio2API-Pro auth vault via isolated askpass..."
+          cat > /tmp/git-askpass.sh <<'EOF'
+          #!/bin/sh
+          echo "$GIT_PAT"
+          EOF
+          chmod 700 /tmp/git-askpass.sh
+          GIT_PAT="$CLONE_PAT" GIT_ASKPASS=/tmp/git-askpass.sh GIT_TERMINAL_PROMPT=0 \
+            git clone --depth=1 "https://x-access-token@github.com/Silver-kun/AIStudio2API-Pro.git" aistudio-pro
+          shred -u /tmp/git-askpass.sh 2>/dev/null || rm -f /tmp/git-askpass.sh
+
+          echo "Fetching latest Mag1cFall/AIStudio2API release..."
+          RELEASE_JSON=$(curl -s "https://api.github.com/repos/Mag1cFall/AIStudio2API/releases/latest")
+          DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[]? | select(.name | test("linux.*(amd64|x86_64)")) | .browser_download_url' | head -n 1)
+
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
+            echo "::error::No linux asset found in latest release"
+            echo "$RELEASE_JSON" | head -c 500
+            exit 1
+          fi
+
+          mkdir -p bin
+          curl -sL --retry 3 "$DOWNLOAD_URL" -o bin/aistudio2api.tar.gz
+          tar -xzf bin/aistudio2api.tar.gz -C bin/ || true
+          chmod +x bin/*
+          BIN_EXEC=$(find bin -type f -executable | head -n 1)
+
+          if [ -z "${BIN_EXEC:-}" ]; then
+            echo "::error::No executable found in extracted archive"
+            ls -la bin/
+            exit 1
+          fi
+
+          BIN_ABS="$(pwd)/$BIN_EXEC"
+          echo "BIN_ABS=$BIN_ABS" >> "$GITHUB_ENV"
+
+          cd aistudio-pro
+          # Patch environment non-destructively (F1: grep-or-add then unconditional sed)
+          [ -f .env ] || touch .env
+          grep -q "^AISTUDIO_PORT=" .env || echo "AISTUDIO_PORT=7865" >> .env
+          grep -q "^AISTUDIO_HOST=" .env || echo "AISTUDIO_HOST=0.0.0.0" >> .env
+          grep -q "^AISTUDIO_AUTH_STATES=" .env || echo "AISTUDIO_AUTH_STATES=auth" >> .env
+          grep -q "^PROXY_API_KEY=" .env || echo "PROXY_API_KEY=123456" >> .env
+          grep -q "^AUTO_START=" .env || echo "AUTO_START=true" >> .env
+          grep -q "^WAA_BACKEND=" .env || echo "WAA_BACKEND=camoufox" >> .env
+          grep -q "^UPSTREAM_CHANNELS=" .env || echo "UPSTREAM_CHANNELS=playground" >> .env
+          grep -q "^ADMIN_AUTH_ENABLED=" .env || echo "ADMIN_AUTH_ENABLED=true" >> .env
+          grep -q "^ADMIN_USERNAME=" .env || echo "ADMIN_USERNAME=silver" >> .env
+          grep -q "^ADMIN_PASSWORD=" .env || echo "ADMIN_PASSWORD=123456" >> .env
+          sed -i -E 's/^WAA_BACKEND=.*/WAA_BACKEND=camoufox/; s/^UPSTREAM_CHANNELS=.*/UPSTREAM_CHANNELS=playground/; s/^ADMIN_AUTH_ENABLED=.*/ADMIN_AUTH_ENABLED=true/; s/^ADMIN_USERNAME=.*/ADMIN_USERNAME=silver/; s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=123456/' .env
+
+          echo "Starting AIStudio2API with Camoufox in background..."
+          nohup env -u CLONE_PAT -u GIT_PAT "$BIN_ABS" -listen 0.0.0.0:7865 -auth auth > aistudio.log 2>&1 &
+          echo $! > ../server.pid
+          cd ..
+
+          echo "Polling AIStudio2API local health endpoint on port 7865..."
+          WARM=false
+          for i in {1..36}; do
+            HEALTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 --max-time 3 -H "Authorization: Bearer 123456" http://localhost:7865/v1/models 2>/dev/null || echo "000")
+            if [ "$HEALTH_CODE" = "200" ]; then
+              echo "AIStudio2API verified 100% warm, operational, and serving models in $((i * 5))s!"
+              WARM=true
+              break
+            elif [ "$HEALTH_CODE" = "401" ]; then
+              echo "AIStudio2API port is open and listening (HTTP 401)! Verified warm in $((i * 5))s."
+              WARM=true
+              break
+            fi
+            sleep 5
+          done
+
+          if [ "$WARM" != "true" ]; then
+            echo "ERROR: Local service failed to warm up within 180s. Tail log (redacted):"
+            tail -n 50 aistudio-pro/aistudio.log 2>/dev/null | \
+              sed -E -e 's/(SID|HSID|SSID|APISID|SAPISID|Secure-1PSID|Secure-3PSID|1PSID|3PSID|NID|AEC|SOCS|SESSION)[^ ,;"]*/\1=[REDACTED]/gi' \
+                     -e 's/(Bearer )[A-Za-z0-9._~-]+/\1[REDACTED]/gi' \
+                     -e 's/(refresh_token|access_token|api_key)[" ]*[:=][" ]*[^", ]+/\1=[REDACTED]/gi' || true
+            exit 1
+          fi
+
+      - name: Circuit Breaker on Pre-Warming Failure
+        if: failure() && steps.prewarm.outcome == 'failure'
+        env:
+          NEXT_PAT: ${{ secrets.NEXT_PAT }}
+        run: |
+          set -euo pipefail
+          # F2: Terminate lingering partially-started process before handling secrets
+          [ -f server.pid ] && kill "$(cat server.pid)" 2>/dev/null || true
+          pkill -fi aistudio2api 2>/dev/null || true
+
+          DEPTH="${{ github.event.inputs.retry_depth }}"
+          DEPTH=${DEPTH:-0}
+          echo "Pre-warming failed. Current circuit-breaker retry depth: $DEPTH"
+          if [ "$DEPTH" -ge 2 ]; then
+            echo "::error::Max retry depth (2) reached. Halting automatic relay to prevent loops."
+            exit 1
+          fi
+
+          NEW_DEPTH=$((DEPTH + 1))
+          REPOS=("vector-drift1/aistudio-relay" "arc-logic1/aistudio-relay")
+          CURRENT_INDEX=-1
+          for i in "${!REPOS[@]}"; do
+            [ "${REPOS[$i]}" = "$GITHUB_REPOSITORY" ] && CURRENT_INDEX=$i && break
+          done
+          [ $CURRENT_INDEX -eq -1 ] && CURRENT_INDEX=0
+          NEXT_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
+          TARGET_REPO="${REPOS[$NEXT_INDEX]}"
+
+          echo "Dispatching fallback runner to partner node: $TARGET_REPO (depth: $NEW_DEPTH)..."
+          sleep 20
+          GH_TOKEN="$NEXT_PAT" gh workflow run relay.yml --repo "$TARGET_REPO" \
+            -f cycle_count="${{ github.event.inputs.cycle_count }}" \
+            -f retry_depth="$NEW_DEPTH" \
+            -f test_handover="${{ github.event.inputs.test_handover }}" || true
+          exit 1
+
+      - name: Install Cloudflare Daemon
+        run: |
+          set -euo pipefail
+          # F3: Secret-less installation step
+          curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
+          sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
+
+      - name: Phase 2 - Cloudflare Tunnel Ingress Takeover
+        env:
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Starting cloudflared replica via root-owned token file..."
+          sudo install -m 600 /dev/null /tmp/cf-token
+          printf '%s' "$CLOUDFLARE_TUNNEL_TOKEN" | sudo tee /tmp/cf-token >/dev/null
+          unset CLOUDFLARE_TUNNEL_TOKEN
+          sudo sh -c 'export TUNNEL_TOKEN="$(cat /tmp/cf-token)"; cloudflared tunnel run > cloudflared.log 2>&1 & echo $! > /tmp/cf.pid'
+          sudo shred -u /tmp/cf-token 2>/dev/null || sudo rm -f /tmp/cf-token
+
+          echo "Verifying edge ingress routing via https://ai.silver-xf.bond..."
+          EDGE_LIVE=false
+          for i in {1..20}; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "https://ai.silver-xf.bond/v1/models" || echo "000")
+            case "$CODE" in
+              200|401|403)
+                echo "Cloudflare Tunnel edge verified live (HTTP $CODE) in $((i * 3))s!"
+                EDGE_LIVE=true
+                break
+                ;;
+            esac
+            sleep 3
+          done
+
+          if [ "$EDGE_LIVE" != "true" ]; then
+            echo "::error::Edge did not report live HTTP response (200/401/403). Aborting predecessor eviction to prevent outage."
+            exit 1
+          fi
+
+      - name: Phase 3 - Evict Predecessor Node Runs
+        env:
+          PREV_PAT: ${{ secrets.PREV_PAT }}
+        run: |
+          set -euo pipefail
+          REPOS=("vector-drift1/aistudio-relay" "arc-logic1/aistudio-relay")
+          CURRENT_INDEX=-1
+          for i in "${!REPOS[@]}"; do
+            [ "${REPOS[$i]}" = "$GITHUB_REPOSITORY" ] && CURRENT_INDEX=$i && break
+          done
+          [ $CURRENT_INDEX -eq -1 ] && CURRENT_INDEX=0
+          PREV_INDEX=$(( (CURRENT_INDEX - 1 + ${#REPOS[@]}) % ${#REPOS[@]} ))
+          PREV_REPO="${REPOS[$PREV_INDEX]}"
+
+          echo "Checking and cancelling all active/queued runs on predecessor: $PREV_REPO..."
+          GH_TOKEN="$PREV_PAT" gh run list --repo "$PREV_REPO" \
+            --json databaseId,status -q '.[] | select(.status=="in_progress" or .status=="queued") | .databaseId' \
+            | while read -r RID; do
+                if [ -n "$RID" ] && [ "$RID" != "null" ]; then
+                  echo "Cancelling predecessor run $RID on $PREV_REPO..."
+                  GH_TOKEN="$PREV_PAT" gh run cancel "$RID" --repo "$PREV_REPO" || true
+                fi
+              done
+
+      - name: Phase 4 - Active Serving & Watchdog
+        run: |
+          set -euo pipefail
+          TEST_MIN="${{ github.event.inputs.test_handover }}"
+          if [ -n "$TEST_MIN" ] && [ "$TEST_MIN" -gt 0 ]; then
+            WORK_MIN="$TEST_MIN"
+          else
+            WORK_MIN=315
+          fi
+
+          echo "Node operational shift: $WORK_MIN minutes active serving with watchdog..."
+          ELAPSED=0
+          FAILS=0
+          while [ $ELAPSED -lt $WORK_MIN ]; do
+            sleep 60
+            ELAPSED=$((ELAPSED + 1))
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 -H "Authorization: Bearer 123456" http://localhost:7865/v1/models 2>/dev/null || echo "000")
+            if [ "$CODE" = "200" ] || [ "$CODE" = "401" ]; then
+              FAILS=0
+            else
+              FAILS=$((FAILS + 1))
+              echo "[$(date +%T)] Local health check failed ($FAILS/3) - HTTP $CODE"
+              if [ $FAILS -ge 3 ]; then
+                echo "CRITICAL: 3 consecutive failures. Restarting AIStudio2API process..."
+                if [ -f server.pid ]; then
+                  kill "$(cat server.pid)" 2>/dev/null || true
+                fi
+                pkill -fi aistudio2api || true
+                sleep 3
+                cd aistudio-pro
+                nohup "$BIN_ABS" -listen 0.0.0.0:7865 -auth auth > aistudio.log 2>&1 &
+                echo $! > ../server.pid
+                cd ..
+                FAILS=0
+              fi
+            fi
+            if [ $((ELAPSED % 15)) -eq 0 ]; then
+              echo "[$(date +%T)] Shift health: $ELAPSED / $WORK_MIN minutes operational."
+            fi
+          done
+
+      - name: Pre-Handover Token Sync
+        env:
+          CLONE_PAT: ${{ secrets.CLONE_PAT }}
+        run: |
+          set +e
+          if [ -d "aistudio-pro" ] && [ -n "${CLONE_PAT:-}" ]; then
+            echo "Persisting refreshed Google cookies back to private auth vault (pre-handover)..."
+            cd aistudio-pro
+            git config user.name "Silver-kun"
+            git config user.email "silver-kun@users.noreply.github.com"
+            git add auth/ .env 2>/dev/null || true
+            if ! git diff --cached --quiet; then
+              printf '#!/bin/sh\necho "$SYNC_PAT"\n' > /tmp/git-sync-askpass.sh
+              chmod 700 /tmp/git-sync-askpass.sh
+              export GIT_ASKPASS=/tmp/git-sync-askpass.sh
+              export GIT_TERMINAL_PROMPT=0
+              export SYNC_PAT="$CLONE_PAT"
+              unset CLONE_PAT
+
+              git commit -m "Auto-refresh: update active session tokens (shift complete) [skip ci]" || true
+              git fetch --unshallow "https://x-access-token@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null \
+                || git fetch "https://x-access-token@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null || true
+              git rebase -X ours FETCH_HEAD 2>/dev/null || { git rebase --abort 2>/dev/null || true; }
+              for retry in 1 2 3; do
+                if git push "https://x-access-token@github.com/Silver-kun/AIStudio2API-Pro.git" HEAD:main 2>&1 | sed 's/:[^@]*@/:***@/'; then
+                  echo "Pre-handover tokens successfully pushed to main."
+                  break
+                fi
+                echo "Push rejected, retrying ($retry/3)..."; sleep 5
+                git fetch "https://x-access-token@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null || true
+                git rebase -X ours FETCH_HEAD 2>/dev/null || { git rebase --abort 2>/dev/null || true; break; }
+              done
+              shred -u /tmp/git-sync-askpass.sh 2>/dev/null || rm -f /tmp/git-sync-askpass.sh
+              unset SYNC_PAT GIT_ASKPASS
+            fi
+          fi
+
+      - name: Phase 4 Handover Dispatch & Graceful Overlap
+        env:
+          NEXT_PAT: ${{ secrets.NEXT_PAT }}
+        run: |
+          set -euo pipefail
+          TEST_MIN="${{ github.event.inputs.test_handover }}"
+          REPOS=("vector-drift1/aistudio-relay" "arc-logic1/aistudio-relay")
+          CURRENT_INDEX=-1
+          for i in "${!REPOS[@]}"; do
+            [ "${REPOS[$i]}" = "$GITHUB_REPOSITORY" ] && CURRENT_INDEX=$i && break
+          done
+          [ $CURRENT_INDEX -eq -1 ] && CURRENT_INDEX=0
+          NEXT_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
+          TARGET_REPO="${REPOS[$NEXT_INDEX]}"
+          NEXT_CYCLE=$(( ${{ github.event.inputs.cycle_count }} + 1 ))
+
+          echo "Initiating shift handover to partner node: $TARGET_REPO (Cycle $NEXT_CYCLE)..."
+          dispatch_runner() {
+            local repo="$1"
+            local pat="$2"
+            echo "Dispatching relay.yml on $repo (Cycle: $NEXT_CYCLE)..."
+            GH_TOKEN="$pat" gh workflow run relay.yml --repo "$repo" \
+              -f cycle_count="$NEXT_CYCLE" -f retry_depth="0" -f test_handover="${TEST_MIN:-0}"
+          }
+
+          if ! dispatch_runner "$TARGET_REPO" "$NEXT_PAT"; then
+            echo "WARNING: Primary dispatch to $TARGET_REPO failed. Retrying in 60s..."
+            sleep 60
+            dispatch_runner "$TARGET_REPO" "$NEXT_PAT" || \
+              GH_TOKEN="$NEXT_PAT" gh workflow run relay.yml --repo "$GITHUB_REPOSITORY" \
+                -f cycle_count="$NEXT_CYCLE" -f retry_depth="0" -f test_handover="${TEST_MIN:-0}" || \
+              { echo "::error::Both partner dispatch and self-dispatch failed!"; exit 1; }
+          fi
+
+          echo "Verifying partner runner pickup within 5 minutes..."
+          SUCCESSOR_ACTIVE=false
+          for check in {1..30}; do
+            ACTIVE_RUNS=$(GH_TOKEN="$NEXT_PAT" gh run list --repo "$TARGET_REPO" --json status -q '[.[] | select(.status=="in_progress" or .status=="queued")] | length' 2>/dev/null || echo "0")
+            if [ "${ACTIVE_RUNS:-0}" -ge 1 ]; then
+              echo "Successor node on $TARGET_REPO confirmed active/queued!"
+              SUCCESSOR_ACTIVE=true
+              break
+            fi
+            sleep 10
+          done
+
+          if [ "$SUCCESSOR_ACTIVE" != "true" ]; then
+            echo "WARNING: Successor did not show in queue after 5m. Triggering emergency self-dispatch fallback..."
+            GH_TOKEN="$NEXT_PAT" gh workflow run relay.yml --repo "$GITHUB_REPOSITORY" \
+              -f cycle_count="$NEXT_CYCLE" -f retry_depth="0" -f test_handover="${TEST_MIN:-0}" || true
+          fi
+
+          unset NEXT_PAT || true
+
+          echo "Entering 20-minute graceful handover standby (predecessor continues serving while successor warms up)..."
+          sleep 20m
+
+      - name: Phase 5 - Teardown & Final Token Sync
+        if: always()
+        env:
+          CLONE_PAT: ${{ secrets.CLONE_PAT }}
+        run: |
+          set +e
+          echo "Terminating cloudflared and AIStudio2API..."
+          if [ -f server.pid ]; then
+            kill "$(cat server.pid)" 2>/dev/null || true
+            sleep 2
+          fi
+          pkill -fi 'aistudio2api' || true
+          sleep 2
+          pkill -9 -fi 'aistudio2api' || true
+          sudo pkill -f cloudflared || true
+
+          if [ -d "aistudio-pro" ] && [ -n "${CLONE_PAT:-}" ]; then
+            echo "Persisting refreshed Google cookies back to private auth vault (teardown)..."
+            cd aistudio-pro
+            git config user.name "Silver-kun"
+            git config user.email "silver-kun@users.noreply.github.com"
+            git add auth/ .env 2>/dev/null || true
+            if ! git diff --cached --quiet; then
+              printf '#!/bin/sh\necho "$SYNC_PAT"\n' > /tmp/git-final-askpass.sh
+              chmod 700 /tmp/git-final-askpass.sh
+              export GIT_ASKPASS=/tmp/git-final-askpass.sh
+              export GIT_TERMINAL_PROMPT=0
+              export SYNC_PAT="$CLONE_PAT"
+              unset CLONE_PAT
+
+              git commit -m "Auto-refresh: update active session tokens (teardown) [skip ci]" || true
+              git fetch --unshallow "https://x-access-token@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null \
+                || git fetch "https://x-access-token@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null || true
+              git rebase -X ours FETCH_HEAD 2>/dev/null || { git rebase --abort 2>/dev/null || true; }
+              for retry in 1 2 3; do
+                if git push "https://x-access-token@github.com/Silver-kun/AIStudio2API-Pro.git" HEAD:main 2>&1 | sed 's/:[^@]*@/:***@/'; then
+                  echo "Final tokens successfully pushed to main."
+                  break
+                fi
+                echo "Push rejected, retrying ($retry/3)..."; sleep 5
+                git fetch "https://x-access-token@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null || true
+                git rebase -X ours FETCH_HEAD 2>/dev/null || { git rebase --abort 2>/dev/null || true; break; }
+              done
+              shred -u /tmp/git-final-askpass.sh 2>/dev/null || rm -f /tmp/git-final-askpass.sh
+              unset SYNC_PAT GIT_ASKPASS
+            fi
+          fi
