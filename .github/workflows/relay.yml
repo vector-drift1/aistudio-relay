@@ -62,10 +62,11 @@ jobs:
           fi
 
           mkdir -p bin
-          curl -sL --retry 3 "$DOWNLOAD_URL" -o bin/aistudio2api.tar.gz
-          tar -xzf bin/aistudio2api.tar.gz -C bin/ || true
+          curl -sL --retry 3 "$DOWNLOAD_URL" -o aistudio2api.tar.gz
+          tar -xzf aistudio2api.tar.gz -C bin/ || true
+          rm -f aistudio2api.tar.gz
           chmod +x bin/*
-          BIN_EXEC=$(find bin -type f -executable | head -n 1)
+          BIN_EXEC=$(find bin -type f -executable ! -name "*.tar.gz" ! -name "*.zip" | head -n 1)
 
           if [ -z "${BIN_EXEC:-}" ]; then
             echo "::error::No executable found in extracted archive"
