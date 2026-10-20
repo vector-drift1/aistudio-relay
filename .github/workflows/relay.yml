@@ -53,7 +53,7 @@ jobs:
 
           echo "Fetching latest Mag1cFall/AIStudio2API release..."
           RELEASE_JSON=$(curl -s "https://api.github.com/repos/Mag1cFall/AIStudio2API/releases/latest")
-          DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[]? | select(.name | test("linux.*(amd64|x86_64)")) | .browser_download_url' | head -n 1)
+          DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[]? | select(.name | test("linux.*(amd64|x86_64).*\\.tar\\.gz$")) | .browser_download_url' | head -n 1)
 
           if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
             echo "::error::No linux asset found in latest release"
