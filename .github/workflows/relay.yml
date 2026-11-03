@@ -52,7 +52,9 @@ jobs:
           shred -u /tmp/git-askpass.sh 2>/dev/null || rm -f /tmp/git-askpass.sh
 
           echo "Fetching latest Mag1cFall/AIStudio2API release..."
-          RELEASE_JSON=$(curl -s "https://api.github.com/repos/Mag1cFall/AIStudio2API/releases/latest")
+          AUTH_HDR=()
+          [ -n "${CLONE_PAT:-}" ] && AUTH_HDR=(-H "Authorization: token ${CLONE_PAT}")
+          RELEASE_JSON=$(curl -s "${AUTH_HDR[@]}" "https://api.github.com/repos/Mag1cFall/AIStudio2API/releases/latest")
           DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[]? | select(.name | test("linux.*(amd64|x86_64).*\\.tar\\.gz$")) | .browser_download_url' | head -n 1)
 
           if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
@@ -122,49 +124,13 @@ jobs:
             exit 1
           fi
 
-      - name: Circuit Breaker on Pre-Warming Failure
-        if: failure() && steps.prewarm.outcome == 'failure'
-        env:
-          NEXT_PAT: ${{ secrets.NEXT_PAT }}
-        run: |
-          set -euo pipefail
-          # F2: Terminate lingering partially-started process before handling secrets
-          [ -f server.pid ] && kill "$(cat server.pid)" 2>/dev/null || true
-          pkill -fi aistudio2api 2>/dev/null || true
-
-          DEPTH="${{ github.event.inputs.retry_depth }}"
-          DEPTH=${DEPTH:-0}
-          echo "Pre-warming failed. Current circuit-breaker retry depth: $DEPTH"
-          if [ "$DEPTH" -ge 2 ]; then
-            echo "::error::Max retry depth (2) reached. Halting automatic relay to prevent loops."
-            exit 1
-          fi
-
-          NEW_DEPTH=$((DEPTH + 1))
-          REPOS=("vector-drift1/aistudio-relay" "arc-logic1/aistudio-relay")
-          CURRENT_INDEX=-1
-          for i in "${!REPOS[@]}"; do
-            [ "${REPOS[$i]}" = "$GITHUB_REPOSITORY" ] && CURRENT_INDEX=$i && break
-          done
-          [ $CURRENT_INDEX -eq -1 ] && CURRENT_INDEX=0
-          NEXT_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
-          TARGET_REPO="${REPOS[$NEXT_INDEX]}"
-
-          echo "Dispatching fallback runner to partner node: $TARGET_REPO (depth: $NEW_DEPTH)..."
-          sleep 20
-          GH_TOKEN="$NEXT_PAT" gh workflow run relay.yml --repo "$TARGET_REPO" \
-            -f cycle_count="${{ github.event.inputs.cycle_count }}" \
-            -f retry_depth="$NEW_DEPTH" \
-            -f test_handover="${{ github.event.inputs.test_handover }}" || true
-          exit 1
-
       - name: Install Cloudflare Daemon
         run: |
           set -euo pipefail
-          # F3: Secret-less installation step
-          curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
-          sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
+          # F3: Secret-less installation step (direct static binary immune to apt repository codename mismatches)
+          sudo curl -fsSL --retry 3 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
 
       - name: Phase 2 - Cloudflare Tunnel Ingress Takeover
         env:
@@ -196,6 +162,43 @@ jobs:
             echo "::error::Edge did not report live HTTP response (200/401/403). Aborting predecessor eviction to prevent outage."
             exit 1
           fi
+
+      - name: Circuit Breaker on Setup Failure
+        if: failure()
+        env:
+          NEXT_PAT: ${{ secrets.NEXT_PAT }}
+        run: |
+          set -euo pipefail
+          # F2: Terminate lingering partially-started process before handling secrets
+          [ -f server.pid ] && kill "$(cat server.pid)" 2>/dev/null || true
+          pkill -fi aistudio2api 2>/dev/null || true
+          sudo pkill -f cloudflared 2>/dev/null || true
+
+          DEPTH="${{ github.event.inputs.retry_depth }}"
+          DEPTH=${DEPTH:-0}
+          echo "Pre-warming or ingress setup failed. Current circuit-breaker retry depth: $DEPTH"
+          if [ "$DEPTH" -ge 2 ]; then
+            echo "::error::Max retry depth (2) reached. Halting automatic relay to prevent loops."
+            exit 1
+          fi
+
+          NEW_DEPTH=$((DEPTH + 1))
+          REPOS=("vector-drift1/aistudio-relay" "arc-logic1/aistudio-relay")
+          CURRENT_INDEX=-1
+          for i in "${!REPOS[@]}"; do
+            [ "${REPOS[$i]}" = "$GITHUB_REPOSITORY" ] && CURRENT_INDEX=$i && break
+          done
+          [ $CURRENT_INDEX -eq -1 ] && CURRENT_INDEX=0
+          NEXT_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
+          TARGET_REPO="${REPOS[$NEXT_INDEX]}"
+
+          echo "Dispatching fallback runner to partner node: $TARGET_REPO (depth: $NEW_DEPTH)..."
+          sleep 20
+          GH_TOKEN="$NEXT_PAT" gh workflow run relay.yml --repo "$TARGET_REPO" \
+            -f cycle_count="${{ github.event.inputs.cycle_count }}" \
+            -f retry_depth="$NEW_DEPTH" \
+            -f test_handover="${{ github.event.inputs.test_handover }}" || true
+          exit 1
 
       - name: Phase 3 - Evict Predecessor Node Runs
         env:
