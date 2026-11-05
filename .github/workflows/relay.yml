@@ -225,6 +225,7 @@ jobs:
               done
 
       - name: Phase 4 - Active Serving & Watchdog
+        id: watchdog
         run: |
           set -euo pipefail
           TEST_MIN="${{ github.event.inputs.test_handover }}"
@@ -303,6 +304,7 @@ jobs:
           fi
 
       - name: Phase 4 Handover Dispatch & Graceful Overlap
+        if: always() && steps.watchdog.conclusion != 'skipped'
         env:
           NEXT_PAT: ${{ secrets.NEXT_PAT }}
         run: |
@@ -356,8 +358,13 @@ jobs:
 
           unset NEXT_PAT || true
 
-          echo "Entering 20-minute graceful handover standby (predecessor continues serving while successor warms up)..."
-          sleep 20m
+          if [ "${{ steps.watchdog.conclusion }}" = "cancelled" ] || [ "${{ steps.watchdog.conclusion }}" = "failure" ]; then
+            echo "Watchdog concluded with '${{ steps.watchdog.conclusion }}'; skipping 20m standby for immediate handover and teardown."
+            sleep 15
+          else
+            echo "Entering 20-minute graceful handover standby (predecessor continues serving while successor warms up)..."
+            sleep 20m
+          fi
 
       - name: Phase 5 - Teardown & Final Token Sync
         if: always()
