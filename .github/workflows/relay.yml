@@ -137,11 +137,11 @@ jobs:
           CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
         run: |
           set -euo pipefail
-          echo "Starting cloudflared replica via root-owned token file..."
+          echo "Starting cloudflared replica via root-owned token file (protocol: http2)..."
           sudo install -m 600 /dev/null /tmp/cf-token
           printf '%s' "$CLOUDFLARE_TUNNEL_TOKEN" | sudo tee /tmp/cf-token >/dev/null
           unset CLOUDFLARE_TUNNEL_TOKEN
-          sudo sh -c 'export TUNNEL_TOKEN="$(cat /tmp/cf-token)"; cloudflared tunnel run > cloudflared.log 2>&1 & echo $! > /tmp/cf.pid'
+          sudo sh -c 'export TUNNEL_TOKEN="$(cat /tmp/cf-token)"; cloudflared tunnel run --protocol http2 > cloudflared.log 2>&1 & echo $! > /tmp/cf.pid'
           sudo shred -u /tmp/cf-token 2>/dev/null || sudo rm -f /tmp/cf-token
 
           echo "Verifying edge ingress routing via https://ai.silver-xf.bond..."
@@ -226,6 +226,8 @@ jobs:
 
       - name: Phase 4 - Active Serving & Watchdog
         id: watchdog
+        env:
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
         run: |
           set -euo pipefail
           TEST_MIN="${{ github.event.inputs.test_handover }}"
@@ -235,12 +237,15 @@ jobs:
             WORK_MIN=315
           fi
 
-          echo "Node operational shift: $WORK_MIN minutes active serving with watchdog..."
+          echo "Node operational shift: $WORK_MIN minutes active serving with dual watchdog (AIStudio2API + Cloudflared)..."
           ELAPSED=0
           FAILS=0
+          CF_FAILS=0
           while [ $ELAPSED -lt $WORK_MIN ]; do
             sleep 60
             ELAPSED=$((ELAPSED + 1))
+
+            # 1. Local AIStudio2API Health Check
             CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 -H "Authorization: Bearer 123456" http://localhost:7865/v1/models 2>/dev/null || echo "000")
             if [ "$CODE" = "200" ] || [ "$CODE" = "401" ]; then
               FAILS=0
@@ -261,6 +266,34 @@ jobs:
                 FAILS=0
               fi
             fi
+
+            # 2. Cloudflared Process Supervision
+            if ! pgrep -f cloudflared >/dev/null; then
+              CF_FAILS=$((CF_FAILS + 1))
+              echo "[$(date +%T)] CRITICAL: cloudflared process is NOT running! Restarting daemon ($CF_FAILS/3)..."
+              sudo install -m 600 /dev/null /tmp/cf-token
+              printf '%s' "$CLOUDFLARE_TUNNEL_TOKEN" | sudo tee /tmp/cf-token >/dev/null
+              sudo sh -c 'export TUNNEL_TOKEN="$(cat /tmp/cf-token)"; cloudflared tunnel run --protocol http2 > cloudflared.log 2>&1 & echo $! > /tmp/cf.pid'
+              sudo shred -u /tmp/cf-token 2>/dev/null || sudo rm -f /tmp/cf-token
+              sleep 5
+            else
+              CF_FAILS=0
+            fi
+
+            # 3. Public Edge Check every 5 minutes
+            if [ $((ELAPSED % 5)) -eq 0 ]; then
+              EDGE_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "https://ai.silver-xf.bond/v1/models" 2>/dev/null || echo "000")
+              if [ "$EDGE_CODE" != "200" ] && [ "$EDGE_CODE" != "401" ] && [ "$EDGE_CODE" != "403" ]; then
+                echo "[$(date +%T)] WARNING: Edge health check returned HTTP $EDGE_CODE. Restarting cloudflared connector..."
+                sudo pkill -f cloudflared || true
+                sleep 2
+                sudo install -m 600 /dev/null /tmp/cf-token
+                printf '%s' "$CLOUDFLARE_TUNNEL_TOKEN" | sudo tee /tmp/cf-token >/dev/null
+                sudo sh -c 'export TUNNEL_TOKEN="$(cat /tmp/cf-token)"; cloudflared tunnel run --protocol http2 > cloudflared.log 2>&1 & echo $! > /tmp/cf.pid'
+                sudo shred -u /tmp/cf-token 2>/dev/null || sudo rm -f /tmp/cf-token
+              fi
+            fi
+
             if [ $((ELAPSED % 15)) -eq 0 ]; then
               echo "[$(date +%T)] Shift health: $ELAPSED / $WORK_MIN minutes operational."
             fi
