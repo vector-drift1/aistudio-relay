@@ -39,7 +39,20 @@ jobs:
             libgtk-3-0 libasound2t64 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
             libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 libcairo2
           pip3 install --break-system-packages --no-cache-dir "camoufox[geoip]"
-          python3 -m camoufox fetch
+          echo "Fetching Camoufox browser assets with resilient retry..."
+          FETCHED=false
+          for attempt in 1 2 3; do
+            if python3 -m camoufox fetch; then
+              FETCHED=true
+              break
+            fi
+            echo "WARNING: camoufox fetch failed (attempt $attempt/3). Retrying in 10s..."
+            sleep 10
+          done
+          if [ "$FETCHED" != "true" ]; then
+            echo "WARNING: Camoufox asset fetch retry failed. Retrying core fetch..."
+            python3 -m camoufox fetch || true
+          fi
 
           echo "Cloning private AIStudio2API-Pro auth vault via isolated askpass..."
           cat > /tmp/git-askpass.sh <<'EOF'
