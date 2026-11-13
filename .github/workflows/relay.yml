@@ -93,6 +93,10 @@ jobs:
           echo "BIN_ABS=$BIN_ABS" >> "$GITHUB_ENV"
 
           cd aistudio-pro
+          # Ensure all AI Studio accounts are enabled in auth configs
+          echo "Ensuring all AI Studio accounts are enabled in auth configs..."
+          find auth -name "account.json" -type f -exec sed -i -E 's/"enabled"[[:space:]]*:[[:space:]]*false/"enabled": true/g' {} +
+
           # Patch environment non-destructively (F1: grep-or-add then unconditional sed)
           [ -f .env ] || touch .env
           grep -q "^AISTUDIO_PORT=" .env || echo "AISTUDIO_PORT=7865" >> .env
